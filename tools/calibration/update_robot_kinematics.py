@@ -50,6 +50,13 @@ _TIMEOUT = flags.DEFINE_float(
   60.0,
   "Timeout in seconds for the calibration update RPC.",
 )
+_IK_SOLVER = flags.DEFINE_string(
+  "ik_solver",
+  "rt_calibrated_ur5e",
+  "IK solver key to set when updating kinematics (e.g."
+  " 'rt_calibrated_ur5e', 'rt_calibrated_ur3e'). Pass an empty string to"
+  " skip setting an explicit IK solver.",
+)
 
 
 def create_robot_update_stub(
@@ -87,15 +94,17 @@ def update_robot_kinematics(
   resource_id: str,
   world_id: str,
   timeout: float = 60.0,
+  ik_solver: str | None = "rt_calibrated_ur5e",
 ) -> None:
   """Requests the RobotUpdateService to fetch calibration from hardware and update the world."""
   request = robot_update_service_pb2.RobotKinematicsUpdateRequest(
     resource_id=resource_id,
     world_id=world_id,
   )
-  request.user_specified_update.set_ik_solvers_update.ik_solvers.add(
-    ik_solver="rt_calibrated_ur5e"
-  )
+  if ik_solver:
+    request.user_specified_update.set_ik_solvers_update.ik_solvers.add(
+      ik_solver=ik_solver
+    )
   try:
     stub.UpdateRobotKinematics(request, timeout=timeout)
     logging.info(
@@ -136,6 +145,7 @@ def main(argv: Sequence[str]) -> None:
   world_id = _WORLD_ID.value
   check_only = _CHECK_ONLY.value
   timeout = _TIMEOUT.value
+  ik_solver = _IK_SOLVER.value
 
   logging.info("Connecting to RobotUpdateService at %s...", address)
   channel, stub = create_robot_update_stub(address)
@@ -185,7 +195,13 @@ def main(argv: Sequence[str]) -> None:
       resource_id,
     )
     try:
-      update_robot_kinematics(stub, resource_id, world_id, timeout=timeout)
+      update_robot_kinematics(
+        stub,
+        resource_id,
+        world_id,
+        timeout=timeout,
+        ik_solver=ik_solver,
+      )
     except grpc.RpcError as e:
       if hasattr(e, "code") and e.code() == grpc.StatusCode.FAILED_PRECONDITION:
         logging.warning(
