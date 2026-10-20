@@ -67,6 +67,7 @@ class Robot:
     self._arm_part_name = config.arm_part_name
     self._tool_object_name = config.tool_object_name
     self._tool_frame_name = config.tool_frame_name
+    self._arm_object_name = config.arm_part_name
     self._move_robot_skill = solution.skills.ai.intrinsic.move_robot
     self._move_to_contact_skill = solution.skills.ai.intrinsic.move_to_contact
 
@@ -430,7 +431,7 @@ class Robot:
     attach_skill = self._solution.skills.ai.intrinsic.attach_object_to_robot
     gripper_ref = object_world_refs_pb2.ObjectReference(
       by_name=object_world_refs_pb2.ObjectReferenceByName(
-        object_name=self._tool_object_name
+        object_name=self._arm_object_name
       )
     )
     object_ref = object_world_refs_pb2.ObjectReference(
@@ -454,7 +455,7 @@ class Robot:
     detach_skill = self._solution.skills.ai.intrinsic.detach_object
     gripper_ref = object_world_refs_pb2.ObjectReference(
       by_name=object_world_refs_pb2.ObjectReferenceByName(
-        object_name=self._tool_object_name
+        object_name=self._arm_object_name
       )
     )
     object_ref = object_world_refs_pb2.ObjectReference(
