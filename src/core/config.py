@@ -20,7 +20,7 @@ from typing import Any, TypeVar
 
 import yaml
 
-from src.core.types import Touchdown
+from src.core.types import GraspPlannerType, Touchdown
 
 _T = TypeVar("_T")
 
@@ -181,6 +181,8 @@ class CycleConfig:
         `<=0` = continuous loop).
       workpiece_id: Name of the workpiece object in `solution.world`.
       approach_offset_z: Vertical offset in meters from `grasp` to `pre_grasp`.
+      standoff_distance_meters: Linear approach standoff distance in meters
+        prior to compliant `move_to_contact` touchdown.
       retract_distance_meters: Tool `-Z` linear retract distance in meters.
       pick_touchdown_force_newtons: Force threshold for infeed pick contact (N).
       load_seat_force_newtons: Force threshold for seating part in vise (N).
@@ -196,6 +198,7 @@ class CycleConfig:
   num_cycles: int
   workpiece_id: str
   approach_offset_z: float
+  standoff_distance_meters: float
   retract_distance_meters: float
   pick_touchdown_force_newtons: float
   load_seat_force_newtons: float
@@ -218,6 +221,79 @@ class ReturnShiftConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class GraspConfig:
+  """Selects and tunes the grasp planning backend used during the infeed pick.
+
+  Only `planner` is meaningful for the built-in `'cuboid_center'` backend; the
+  `moveit_*` fields are forwarded to the `intrinsic-moveit` integration and are
+  ignored otherwise.
+
+  Attributes:
+      planner: Grasp planner backend (`'cuboid_center'` or `'moveit'`).
+      moveit_tool_frame_name: MoveIt robot model link used as the grasp TCP.
+        This is an SRDF link name, not an Object World frame.
+      moveit_group_name: MoveIt planning group for the arm.
+      moveit_end_effector_group: MoveIt end-effector group.
+      moveit_surfaces: Workpiece surfaces to sample grasp candidates on
+        (`0:+X, 1:-X, 2:+Y, 3:-Y, 4:+Z, 5:-Z`). Empty means every surface.
+      moveit_num_rotations: Grasp candidates per surface, spread evenly about
+        the surface normal.
+      moveit_retract_dist_m: Distance in meters between the planned grasp and
+        pre-grasp frames.
+      moveit_timeout_ms: Grasp planning timeout in milliseconds.
+      moveit_settle_seconds: Dwell before planning, letting the MoveIt planning
+        scene catch up with the workpiece pose perception just published.
+  """
+
+  planner: str = GraspPlannerType.CUBOID_CENTER.value
+  moveit_tool_frame_name: str = "hande_tcp"
+  moveit_group_name: str = "ur_manipulator"
+  moveit_end_effector_group: str = "hand"
+  moveit_surfaces: tuple[int, ...] = ()
+  moveit_num_rotations: int = 4
+  moveit_retract_dist_m: float = 0.05
+  moveit_timeout_ms: float = 15000.0
+  moveit_settle_seconds: float = 0.3
+
+  def __post_init__(self) -> None:
+    valid = sorted(member.value for member in GraspPlannerType)
+    if self.planner not in valid:
+      raise ValueError(
+        f"Unsupported grasp planner '{self.planner}' in section 'grasp'. "
+        f"Expected one of {valid}."
+      )
+    if any(not 0 <= surface <= 5 for surface in self.moveit_surfaces):
+      raise ValueError(
+        f"moveit_surfaces entries must be in 0..5, got "
+        f"{list(self.moveit_surfaces)}."
+      )
+    if self.moveit_num_rotations <= 0:
+      raise ValueError(
+        f"moveit_num_rotations must be positive, got "
+        f"{self.moveit_num_rotations}."
+      )
+    if self.moveit_retract_dist_m <= 0.0:
+      raise ValueError(
+        f"moveit_retract_dist_m must be positive, got "
+        f"{self.moveit_retract_dist_m}."
+      )
+    if self.moveit_timeout_ms <= 0.0:
+      raise ValueError(
+        f"moveit_timeout_ms must be positive, got {self.moveit_timeout_ms}."
+      )
+    if self.moveit_settle_seconds < 0.0:
+      raise ValueError(
+        f"moveit_settle_seconds must not be negative, got "
+        f"{self.moveit_settle_seconds}."
+      )
+
+  @property
+  def planner_type(self) -> GraspPlannerType:
+    """Returns `planner` as its enum member."""
+    return GraspPlannerType(self.planner)
+
+
+@dataclasses.dataclass(frozen=True)
 class AppConfig:
   """Top-level configuration for a machine tending cell deployment.
 
@@ -229,6 +305,8 @@ class AppConfig:
       frames: Named world transform frames for motion planning.
       cycle: Cycle execution, force, and timeout parameters.
       machine: Optional CNC enclosure, vise, and handshake configuration.
+      grasp: Grasp planner selection. Defaults to the built-in cuboid-center
+        planner when the section is omitted.
   """
 
   cell_name: str
@@ -238,12 +316,14 @@ class AppConfig:
   frames: FramesConfig
   cycle: CycleConfig
   machine: MachineConfig | None = None
+  grasp: GraspConfig = dataclasses.field(default_factory=GraspConfig)
 
   @property
   def pick_touchdown(self) -> Touchdown:
     """Returns compliant touchdown parameters for picking from the infeed."""
     return Touchdown(
       force_n=self.cycle.pick_touchdown_force_newtons,
+      standoff_m=self.cycle.standoff_distance_meters,
       timeout_s=self.cycle.touchdown_timeout_seconds,
       retract_after_m=self.cycle.retract_distance_meters,
     )
@@ -253,6 +333,7 @@ class AppConfig:
     """Returns compliant touchdown parameters for seating into the CNC vise."""
     return Touchdown(
       force_n=self.cycle.load_seat_force_newtons,
+      standoff_m=self.cycle.standoff_distance_meters,
       timeout_s=self.cycle.touchdown_timeout_seconds,
       retract_after_m=0.0,
     )
@@ -262,7 +343,9 @@ class AppConfig:
     """Returns compliant touchdown parameters for grasping from the CNC vise."""
     return Touchdown(
       force_n=self.cycle.unload_touchdown_force_newtons,
-      standoff_m=0.020 + self.cycle.retract_distance_meters,
+      standoff_m=(
+        self.cycle.standoff_distance_meters + self.cycle.retract_distance_meters
+      ),
       timeout_s=self.cycle.touchdown_timeout_seconds,
       retract_after_m=self.cycle.retract_distance_meters,
     )
@@ -272,6 +355,9 @@ class AppConfig:
     """Returns compliant touchdown parameters for returning to the infeed."""
     return Touchdown(
       force_n=self.cycle.return_touchdown_force_newtons,
+      standoff_m=(
+        self.cycle.standoff_distance_meters + self.cycle.retract_distance_meters
+      ),
       timeout_s=self.cycle.touchdown_timeout_seconds,
       retract_after_m=0.0,
     )
@@ -346,6 +432,12 @@ def _construct_section(
         section_dict[joint_key] = tuple(
           float(x) for x in section_dict[joint_key]
         )
+  elif section_name == "grasp" and isinstance(
+    section_dict.get("moveit_surfaces"), list
+  ):
+    section_dict["moveit_surfaces"] = tuple(
+      int(x) for x in section_dict["moveit_surfaces"]
+    )
 
   return cls(**section_dict)
 
@@ -377,6 +469,11 @@ def load_app_config(path: str | pathlib.Path) -> AppConfig:
     if "machine" in raw_data and raw_data["machine"] is not None
     else None
   )
+  grasp_config = (
+    _construct_section(GraspConfig, raw_data, "grasp", file_path)
+    if "grasp" in raw_data and raw_data["grasp"] is not None
+    else GraspConfig()
+  )
 
   return AppConfig(
     cell_name=str(raw_data["cell_name"]),
@@ -386,4 +483,5 @@ def load_app_config(path: str | pathlib.Path) -> AppConfig:
     vision=_construct_section(VisionConfig, raw_data, "vision", file_path),
     frames=_construct_section(FramesConfig, raw_data, "frames", file_path),
     cycle=_construct_section(CycleConfig, raw_data, "cycle", file_path),
+    grasp=grasp_config,
   )

@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hardware abstractions and adapters for the Open Machine Tending Solution."""
-
+from src.hardware.grasping import GraspPlannerInterface
 from src.hardware.gripper import (
   DioGripper,
   GripperInterface,
@@ -23,17 +22,17 @@ from src.hardware.machine import (
   CncMachineInterface,
   DioCncMachine,
 )
-from src.hardware.robot import RobotInterface, UrRobot
+from src.hardware.robot import Robot
 from src.hardware.vision import OrbbecVision, VisionInterface
 
 __all__ = [
   "CncMachineInterface",
   "DioCncMachine",
   "DioGripper",
+  "GraspPlannerInterface",
   "GripperInterface",
   "OrbbecVision",
-  "RobotInterface",
+  "Robot",
   "RobotiqGripper",
-  "UrRobot",
   "VisionInterface",
 ]

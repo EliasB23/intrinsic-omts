@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for stateless hardware adapters (UrRobot, Grippers, DioCncMachine, OrbbecVision)."""
+"""Unit tests for stateless hardware adapters (Robot, Grippers, DioCncMachine, OrbbecVision)."""
 
 import inspect
 from unittest import mock
@@ -29,13 +29,13 @@ from src.core.config import (
 from src.core.types import JointPosition
 from src.hardware.gripper import DioGripper, RobotiqGripper
 from src.hardware.machine import DioCncMachine
-from src.hardware.robot import UrRobot
+from src.hardware.robot import Robot
 from src.hardware.vision import OrbbecVision
 
 
 class HardwareAdaptersTest(absltest.TestCase):
   def test_ur_robot_has_no_disable_collision_checking(self):
-    sig = inspect.signature(UrRobot.__init__)
+    sig = inspect.signature(Robot.__init__)
     self.assertNotIn("disable_collision_checking", sig.parameters)
 
   def test_ur_robot_motion_and_object_attachment(self):
@@ -63,7 +63,7 @@ class HardwareAdaptersTest(absltest.TestCase):
       tool_object_name="gripper",
       tool_frame_name="tool_frame",
     )
-    robot = UrRobot(
+    robot = Robot(
       solution=mock_solution,
       config=robot_config,
     )
@@ -446,7 +446,7 @@ class HardwareAdaptersTest(absltest.TestCase):
     mock_move_robot.return_value = bt.PythonScript(function_body="pass")
     mock_solution.skills.ai.intrinsic.move_robot = mock_move_robot
 
-    robot = UrRobot(
+    robot = Robot(
       solution=mock_solution,
       config=RobotConfig(
         arm_part_name="ur_module",
@@ -534,6 +534,21 @@ class HardwareAdaptersTest(absltest.TestCase):
     self.assertEqual(
       inner_seq.children[2].name,
       "3. Calculate & Update Dynamic Grasp & Pre-Grasp Frames",
+    )
+
+    # With an external grasp planner, step 3 only localizes the workpiece.
+    suppressed = vision.build_perception_and_spawn_task(
+      approach_offset_z=0.08,
+      parent_object="root",
+      pregrasp_frame_name="pre_grasp",
+      grasp_frame_name="grasp",
+      tool_object_name="gripper",
+      tool_frame_name="tool_frame",
+      publish_grasp_frames=False,
+      max_tries=3,
+    )
+    self.assertEqual(
+      suppressed.child.children[2].name, "3. Update Detected Workpiece Pose"
     )
 
   def test_orbbec_vision_signature_cleanups(self):
@@ -638,7 +653,7 @@ class HardwareAdaptersTest(absltest.TestCase):
     mock_move_robot.return_value = bt.PythonScript(function_body="pass")
     mock_solution.skills.ai.intrinsic.move_robot = mock_move_robot
 
-    robot = UrRobot(
+    robot = Robot(
       solution=mock_solution,
       config=RobotConfig(
         arm_part_name="ur_module",
@@ -779,7 +794,12 @@ class HardwareAdaptersTest(absltest.TestCase):
     # max_tries=1 returns bt.Sequence directly without bt.Retry wrapper
     self.assertIsInstance(seq_task, bt.Sequence)
     self.assertIsNotNone(real_pb.last_parameters)
-    self.assertLen(real_pb.last_parameters.fields, 16)
+    self.assertLen(real_pb.last_parameters.fields, 17)
+    publish_field = real_pb.last_parameters.fields[-1]
+    self.assertEqual(publish_field.name, "publish_grasp_frames")
+    self.assertEqual(publish_field.number, 17)
+    self.assertEqual(publish_field.type, "bool")
+    self.assertTrue(publish_field.arg)
 
     # Missing resources raise ValueError
     mock_solution.resources = {}

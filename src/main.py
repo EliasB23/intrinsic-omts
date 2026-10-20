@@ -25,10 +25,11 @@ from src.core.infeed import (
   InfeedMode,
   PerceptionInfeedStrategy,
 )
-from src.core.types import SimulationMode
+from src.core.types import GraspPlannerType, SimulationMode
+from src.hardware.grasp_planners import create_grasp_planner
 from src.hardware.gripper import DioGripper, GripperInterface, RobotiqGripper
 from src.hardware.machine import DioCncMachine
-from src.hardware.robot import UrRobot
+from src.hardware.robot import Robot
 from src.hardware.vision import OrbbecVision
 from src.utils.execution_utils import to_executive_simulation_mode
 
@@ -53,6 +54,13 @@ _NUM_CYCLES = flags.DEFINE_integer(
   None,
   "Optional override for number of cycles (1 = single, >1 = finite Loop, <=0 = continuous Loop).",
 )
+_GRASP_PLANNER = flags.DEFINE_enum_class(
+  "grasp_planner",
+  None,
+  GraspPlannerType,
+  "Optional override for the grasp planner backend, taking precedence over "
+  "the 'grasp' section of the cell config.",
+)
 
 
 def run_machine_tending_pipeline(
@@ -60,6 +68,7 @@ def run_machine_tending_pipeline(
   config: AppConfig,
   simulation_mode: SimulationMode | None = None,
   num_cycles_override: int | None = None,
+  grasp_planner_override: GraspPlannerType | None = None,
 ) -> None:
   """Connects to the solution deployment and executes the machine tending BT.
 
@@ -69,6 +78,8 @@ def run_machine_tending_pipeline(
       simulation_mode: Optional executive execution mode override.
       num_cycles_override: Optional cycle count override (1 = single cycle,
         >1 = finite bt.Loop, <=0 = continuous bt.Loop).
+      grasp_planner_override: Optional grasp planner backend override, taking
+        precedence over `config.grasp`.
   """
   logging.info(
     "Connecting to Intrinsic solution at %s (cell: %s)...",
@@ -89,7 +100,7 @@ def run_machine_tending_pipeline(
       config=config.gripper,
     )
 
-  robot = UrRobot(
+  robot = Robot(
     solution=solution,
     config=config.robot,
   )
@@ -117,6 +128,18 @@ def run_machine_tending_pipeline(
     view_frame_name=config.frames.view_frame,
   )
 
+  planner_type = (
+    grasp_planner_override
+    if grasp_planner_override is not None
+    else config.grasp.planner_type
+  )
+  grasp_planner = create_grasp_planner(
+    planner_type=planner_type,
+    solution=solution,
+    config=config.grasp,
+    tool_object_name=config.robot.tool_object_name,
+  )
+
   tree = build_machine_tending_behavior_tree(
     robot=robot,
     gripper=gripper,
@@ -125,6 +148,7 @@ def run_machine_tending_pipeline(
     infeed_strategy=infeed_strategy,
     config=config,
     num_cycles_override=num_cycles_override,
+    grasp_planner=grasp_planner,
   )
 
   exec_sim_mode = to_executive_simulation_mode(simulation_mode)
@@ -134,7 +158,9 @@ def run_machine_tending_pipeline(
     else config.cycle.num_cycles
   )
   logging.info(
-    "Executing machine tending Behavior Tree (cycles=%d)...", num_cycles
+    "Executing machine tending Behavior Tree (cycles=%d, grasp_planner=%s)...",
+    num_cycles,
+    planner_type.value,
   )
   solution.executive.run(tree, simulation_mode=exec_sim_mode)
 
@@ -156,6 +182,7 @@ def main(argv: Sequence[str]) -> None:
     config=config,
     simulation_mode=_SIMULATION_MODE.value,
     num_cycles_override=_NUM_CYCLES.value,
+    grasp_planner_override=_GRASP_PLANNER.value,
   )
 
 

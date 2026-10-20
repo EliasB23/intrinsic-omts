@@ -8,13 +8,13 @@ module(name = "omts")
 #
 # When bumping INTRINSIC_CORE_RELEASE, update INTRINSIC_CORE_SHA256 with:
 #   curl -fsSL "https://github.com/intrinsic-ai/intrinsic-core/releases/download/<tag>/intrinsic-core.tar.gz" | sha256sum
-INTRINSIC_CORE_RELEASE = "20260922.0"
+INTRINSIC_CORE_RELEASE = "20261012.0"
 
 INTRINSIC_CORE_URL = "https://github.com/intrinsic-ai/intrinsic-core/releases/download/{tag}/intrinsic-core.tar.gz".format(
     tag = INTRINSIC_CORE_RELEASE,
 )
 
-INTRINSIC_CORE_SHA256 = "0009109250de1bec3b48abdd0a2ac36e7486447738810ebbb7fa216e2d5436f0"
+INTRINSIC_CORE_SHA256 = "41dec7c162c5819495a21f5114c0abd3203cd188b9fbc26b7e62205c98ce53c3"
 
 bazel_dep(name = "intrinsic-core")
 archive_override(
@@ -51,13 +51,7 @@ archive_override(
     ],
 )
 
-bazel_dep(name = "zenoh-c", version = "1.7.2.bcr.1")
-single_version_override(
-    module_name = "zenoh-c",
-    patch_strip = 1,
-    patches = ["//bazel/patches:zenohc.patch"],
-)
-
+bazel_dep(name = "zenoh-c", version = "1.8.0.bcr.1")
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
 bazel_dep(name = "rules_license", version = "1.0.0")
 bazel_dep(name = "abseil-py", version = "2.1.0", repo_name = "com_google_absl_py")
@@ -73,6 +67,13 @@ bazel_dep(name = "protobuf", version = "32.1", repo_name = "com_google_protobuf"
 single_version_override(
     module_name = "protobuf",
     version = "32.1",
+)
+
+# TODO: Remove this override when updating INTRINSIC_CORE_RELEASE to the next
+# release (not yet available), as this is already fixed on intrinsic-core main.
+single_version_override(
+    module_name = "tinygltf",
+    version = "2.9.6.bcr.1",
 )
 
 python = use_extension("@rules_python//python/extensions:python.bzl", "python")
@@ -138,9 +139,9 @@ go_deps.gazelle_override(
 go_deps.gazelle_override(
     build_file_generation = "on",
     directives = [
-        "gazelle:prefix github.com/googlecloudrobotics/core/src",
+        "gazelle:prefix github.com/googlecloudrobotics/core",
     ],
-    path = "github.com/googlecloudrobotics/core/src",
+    path = "github.com/googlecloudrobotics/core",
 )
 
 # Prebuilt asset bundles that are not built from source by this repository.
@@ -184,11 +185,19 @@ gh.download(
     sha256 = "b872cd424ad3c81e8a3f719394b459917107e832e868c9f427788156bd97283d",
     tag = OMTS_ASSETS_RELEASE,
 )
+gh.download(
+    name = "moveit_plan_grasp_skill_bundle",
+    pattern = "moveit_plan_grasp_skill.bundle.tar",
+    repo = "intrinsic-ai/intrinsic-moveit",
+    sha256 = "34b1187754fa87528b6d240ea1d407c756808d23997829e3a1776d6095e2524e",
+    tag = "v0.0.3",
+)
 use_repo(
     gh,
     "flowstate_ros_bridge_bundle",
     "hand_e_gripper_cmd_skill_bundle",
     "hand_e_gripper_service_bundle",
+    "moveit_plan_grasp_skill_bundle",
     "orbbec_gemini_driver_bundle",
     "segmentation_weights_bundle",
 )

@@ -38,15 +38,46 @@ from intrinsic.world.python import object_world_resources
 from src.behaviors.load_machine import build_load_machine_subtree
 from src.behaviors.machine_tending_bt import build_machine_tending_behavior_tree
 from src.behaviors.machining import build_machining_handshake_subtree
+from src.behaviors.motions import (
+  create_compliant_touchdown_task,
+  create_seated_approach_tasks,
+)
 from src.behaviors.pick import build_pick_from_infeed_subtree
 from src.behaviors.return_infeed import build_return_to_infeed_subtree
 from src.behaviors.unload_machine import build_unload_machine_subtree
 from src.core.config import load_app_config
-from src.core.infeed import PerceptionInfeedStrategy
+from src.core.infeed import InfeedStrategy, PerceptionInfeedStrategy
+from src.core.types import InfeedMode
+from src.hardware.grasping import GraspPlannerInterface
 from src.hardware.gripper import DioGripper, GripperInterface, RobotiqGripper
 from src.hardware.machine import CncMachineInterface, DioCncMachine
-from src.hardware.robot import RobotInterface, UrRobot
+from src.hardware.robot import Robot
 from src.hardware.vision import OrbbecVision, VisionInterface
+
+_FAKE_PLANNER_TASK_NAME = "Fake Plan Grasp"
+
+
+class _FakeGraspPlanner(GraspPlannerInterface):
+  def __init__(self) -> None:
+    self.calls: list[dict[str, str]] = []
+
+  def build_plan_grasp_task(
+    self,
+    workpiece_object_name: str,
+    parent_object: str = "root",
+    grasp_frame_name: str = "grasp",
+    pregrasp_frame_name: str = "pre_grasp",
+    name: str | None = None,
+  ) -> bt.Node:
+    self.calls.append(
+      {
+        "workpiece_object_name": workpiece_object_name,
+        "parent_object": parent_object,
+        "grasp_frame_name": grasp_frame_name,
+        "pregrasp_frame_name": pregrasp_frame_name,
+      }
+    )
+    return bt.Sequence(name=name or _FAKE_PLANNER_TASK_NAME, children=[])
 
 
 def _make_mock_node_builder(name_prefix: str):
@@ -63,7 +94,7 @@ class BehaviorsTest(absltest.TestCase):
     super().setUp()
     self.config = load_app_config("configs/omts/app_config.yaml")
 
-    self.robot = mock.MagicMock(spec=RobotInterface)
+    self.robot = mock.MagicMock(spec=Robot)
     self.robot.build_move_joint_task.side_effect = _make_mock_node_builder(
       "Move Joint"
     )
@@ -183,6 +214,7 @@ class BehaviorsTest(absltest.TestCase):
       grasp_frame_name="grasp",
       tool_object_name="gripper",
       tool_frame_name="tool_frame",
+      publish_grasp_frames=True,
       name="Perception & Dynamic Grasp Frame Update Pipeline",
     )
     self.robot.build_attach_object_task.assert_called_once_with(
@@ -196,6 +228,81 @@ class BehaviorsTest(absltest.TestCase):
       name="Infeed Pick: Linear Retract (1.5 cm, -Z Tool)",
     )
 
+  def test_build_infeed_pick_subtree_runs_grasp_planner_after_perception(self):
+    planner = _FakeGraspPlanner()
+
+    pick_subtree = build_pick_from_infeed_subtree(
+      robot=self.robot,
+      gripper=self.gripper,
+      vision=self.vision,
+      infeed_strategy=self.infeed_strategy,
+      config=self.config,
+      machine=self.machine,
+      grasp_planner=planner,
+    )
+
+    # Exactly one task more than the cuboid-center subtree above.
+    self.assertEqual(len(pick_subtree.children), 14)
+    self.assertEqual(
+      planner.calls,
+      [
+        {
+          "workpiece_object_name": "raw_stock_2x3x5",
+          "parent_object": "root",
+          "grasp_frame_name": "grasp",
+          "pregrasp_frame_name": "pre_grasp",
+        }
+      ],
+    )
+
+    # The planner owns the grasp frames, so the heuristic must not also write
+    # them; perception still localizes the part.
+    perception_call = self.vision.build_perception_and_spawn_task.call_args
+    self.assertFalse(perception_call.kwargs["publish_grasp_frames"])
+
+    # The planner refines a pose that perception has already established, so
+    # it must run after the perception pipeline and before the gripper opens.
+    child_names = [child.name for child in pick_subtree.children]
+    self.assertEqual(
+      child_names.index(_FAKE_PLANNER_TASK_NAME),
+      child_names.index("Perception & Dynamic Grasp Frame Update Pipeline") + 1,
+    )
+    self.assertLess(
+      child_names.index(_FAKE_PLANNER_TASK_NAME),
+      child_names.index("Open Gripper"),
+    )
+
+  def test_build_infeed_pick_subtree_rejects_planner_without_perception(self):
+    grid_strategy = mock.MagicMock(spec=InfeedStrategy)
+    grid_strategy.mode = InfeedMode.GRID
+
+    with self.assertRaises(ValueError):
+      build_pick_from_infeed_subtree(
+        robot=self.robot,
+        gripper=self.gripper,
+        vision=self.vision,
+        infeed_strategy=grid_strategy,
+        config=self.config,
+        machine=self.machine,
+        grasp_planner=_FakeGraspPlanner(),
+      )
+
+  def test_build_master_behavior_tree_forwards_grasp_planner(self):
+    planner = _FakeGraspPlanner()
+
+    build_machine_tending_behavior_tree(
+      robot=self.robot,
+      gripper=self.gripper,
+      machine=self.machine,
+      vision=self.vision,
+      infeed_strategy=self.infeed_strategy,
+      config=self.config,
+      num_cycles_override=1,
+      grasp_planner=planner,
+    )
+
+    self.assertLen(planner.calls, 1)
+
   def test_build_load_machine_subtree_steps_and_detachment(self):
     load_subtree = build_load_machine_subtree(
       robot=self.robot,
@@ -207,6 +314,22 @@ class BehaviorsTest(absltest.TestCase):
     self.assertIsNotNone(load_subtree)
     self.assertEqual(len(load_subtree.children), 8)
     self.assertEqual(self.robot.build_move_blended_cartesian_task.call_count, 2)
+    self.robot.build_move_blended_cartesian_task.assert_any_call(
+      target_frames=[
+        ("root", "transit"),
+        ("root", "machine_approach"),
+        ("root", "vise_pre_place"),
+        ("root", "vise_place"),
+      ],
+      motion_type=["ANY", "ANY", "ANY", "LINEAR"],
+      target_frame_offset=((0.0, 0.0, -0.02), (0.0, 0.0, 0.0, 1.0)),
+      excluded_collision_pairs=[
+        ("raw_stock_2x3x5", "schunk_egp_64nnb"),
+        ("gripper", "schunk_egp_64nnb"),
+        ("gripper", "raw_stock_2x3x5"),
+      ],
+      name="Load Vise: Blended Approach to Standoff (root/vise_place)",
+    )
     self.robot.build_detach_object_task.assert_called_once_with(
       object_name="raw_stock_2x3x5",
       name="Detach raw_stock_2x3x5 from Gripper",
@@ -288,17 +411,96 @@ class BehaviorsTest(absltest.TestCase):
       object_name="raw_stock_2x3x5",
       name="Detach raw_stock_2x3x5 from Gripper",
     )
-    self.robot.build_move_cartesian_task.assert_called_once_with(
+    expected_collision_pairs = [
+      ("gripper", "raw_stock_2x3x5"),
+      ("enclosure", "raw_stock_2x3x5"),
+      ("gripper", "enclosure"),
+    ]
+    self.assertEqual(self.robot.build_move_cartesian_task.call_count, 3)
+    self.robot.build_move_cartesian_task.assert_any_call(
       target_frame_name="grasp",
       target_object_name="root",
       motion_type="LINEAR",
       allow_tool_z_rotation=False,
       cone_opening_half_angle=0.0,
       moving_frame_offset=None,
-      target_frame_offset=((0.0, 0.0, -0.02), (0.0, 0.0, 0.0, 1.0)),
-      excluded_collision_pairs=[("gripper", "raw_stock_2x3x5")],
+      target_frame_offset=((0.0, 0.0, -0.035), (0.0, 0.0, 0.0, 1.0)),
+      excluded_collision_pairs=expected_collision_pairs,
       name="Return Infeed: Linear Approach to Standoff (root/grasp)",
     )
+    self.robot.build_move_cartesian_task.assert_any_call(
+      target_frame_name="grasp",
+      target_object_name="root",
+      motion_type="LINEAR",
+      allow_tool_z_rotation=False,
+      cone_opening_half_angle=0.0,
+      moving_frame_offset=None,
+      target_frame_offset=((0.0, 0.0, -0.035), (0.0, 0.0, 0.0, 1.0)),
+      excluded_collision_pairs=expected_collision_pairs,
+      name="Return Infeed: Re-approach Standoff (root/grasp)",
+    )
+    self.robot.build_move_cartesian_task.assert_any_call(
+      target_frame_name="grasp",
+      target_object_name="root",
+      motion_type="LINEAR",
+      allow_tool_z_rotation=False,
+      cone_opening_half_angle=0.0,
+      moving_frame_offset=None,
+      target_frame_offset=((0.0, 0.0, -0.015), (0.0, 0.0, 0.0, 1.0)),
+      excluded_collision_pairs=expected_collision_pairs,
+      name="Return Infeed: Fallback Linear Seat (root/grasp)",
+    )
+
+  def test_seated_approach_touchdown_retry_and_fallback_structure(self):
+    tasks = create_seated_approach_tasks(
+      robot=self.robot,
+      frame_name="grasp",
+      parent_object="root",
+      touchdown=self.config.pick_touchdown,
+      config=self.config,
+      label="Infeed Pick",
+      excluded_collision_pairs=[("gripper", "raw_stock_2x3x5")],
+    )
+    self.assertLen(tasks, 3)
+    approach_node, touchdown_node, retract_node = tasks
+    self.assertEqual(
+      approach_node.name,
+      "Infeed Pick: Linear Approach to Standoff (root/grasp)",
+    )
+    self.assertEqual(
+      retract_node.name,
+      "Infeed Pick: Linear Retract (1.5 cm, -Z Tool)",
+    )
+    self.assertIsInstance(touchdown_node, bt.Fallback)
+    self.assertEqual(
+      touchdown_node.name, "Infeed Pick: Compliant Touchdown (+Z Tool)"
+    )
+    self.assertLen(touchdown_node.tries, 2)
+
+    retry_node = touchdown_node.tries[0].node
+    fallback_node = touchdown_node.tries[1].node
+    self.assertIsInstance(retry_node, bt.Retry)
+    self.assertEqual(retry_node.max_tries, 2)
+    self.assertEqual(
+      retry_node.name, "Infeed Pick: Compliant Touchdown (+Z Tool) (Retry)"
+    )
+    self.assertEqual(
+      retry_node.child.name, "Infeed Pick: Compliant Touchdown (+Z Tool)"
+    )
+    self.assertEqual(
+      retry_node.recovery.name,
+      "Infeed Pick: Re-approach Standoff (root/grasp)",
+    )
+    self.assertEqual(
+      fallback_node.name, "Infeed Pick: Fallback Linear Seat (root/grasp)"
+    )
+
+    direct_task = create_compliant_touchdown_task(
+      robot=self.robot,
+      touchdown=self.config.pick_touchdown,
+      task_name="Direct Touchdown",
+    )
+    self.assertEqual(direct_task.name, "Direct Touchdown")
 
   def test_build_master_behavior_tree_without_cnc_machine(self):
     lab_config = load_app_config("configs/lab_bb_01/app_config.yaml")
@@ -315,13 +517,25 @@ class BehaviorsTest(absltest.TestCase):
     self.assertIsInstance(tree.root, bt.Sequence)
     self.assertEqual(len(tree.root.children), 5)
     self.vision.build_perception_and_spawn_task.assert_called_once_with(
-      approach_offset_z=0.08,
+      approach_offset_z=lab_config.cycle.approach_offset_z,
       parent_object="root",
       pregrasp_frame_name="pre_grasp",
       grasp_frame_name="grasp",
       tool_object_name="gripper",
       tool_frame_name="tool_frame",
+      publish_grasp_frames=True,
       name="Perception & Dynamic Grasp Frame Update Pipeline",
+    )
+    retract_m = lab_config.cycle.retract_distance_meters
+    self.robot.build_move_relative_cartesian_task.assert_any_call(
+      translation=(0.0, 0.0, -retract_m),
+      motion_type="LINEAR",
+      excluded_collision_pairs=[
+        ("gripper", "raw_stock_2x3x5"),
+        ("enclosure", "raw_stock_2x3x5"),
+        ("gripper", "enclosure"),
+      ],
+      name=f"Unload Vise: Linear Retract ({retract_m * 100:.1f} cm, -Z Tool)",
     )
     self.machine.build_open_door_task.assert_not_called()
     self.machine.build_close_door_task.assert_not_called()
@@ -1038,7 +1252,7 @@ class HermeticSolutionAndBehaviorTreeContractTest(absltest.TestCase):
     cell_key = "lab_bb_01" if "lab_bb_01" in config_path else "omts"
     world_objects = self.cell_world_objects[cell_key]
     solution = FakeSolution(self.skill_infos, world_objects=world_objects)
-    robot = UrRobot(solution=solution, config=config.robot)
+    robot = Robot(solution=solution, config=config.robot)
     if use_dio_gripper:
       dio_gripper_cfg = dataclasses.replace(
         config.gripper,
@@ -1130,7 +1344,10 @@ class HermeticSolutionAndBehaviorTreeContractTest(absltest.TestCase):
           exec_code.parameter_message_full_name,
         )
         self.assertTrue(exec_code.parameters.proto.Unpack(params_msg))
-        self.assertAlmostEqual(params_msg.approach_offset_z, 0.08, places=5)
+        expected_offset_z = load_app_config(config_path).cycle.approach_offset_z
+        self.assertAlmostEqual(
+          params_msg.approach_offset_z, expected_offset_z, places=5
+        )
         self.assertEqual(params_msg.parent_object, "root")
         self.assertEqual(params_msg.pregrasp_frame_name, "pre_grasp")
         self.assertEqual(params_msg.grasp_frame_name, "grasp")
@@ -1273,7 +1490,7 @@ class HermeticSolutionAndBehaviorTreeContractTest(absltest.TestCase):
       self.skill_infos,
       world_objects=self.cell_world_objects["omts"],
     )
-    robot = UrRobot(solution=solution, config=config.robot)
+    robot = Robot(solution=solution, config=config.robot)
     assert config.machine is not None
     machine = DioCncMachine(solution=solution, config=config.machine)
     illegal_parallel_tree = bt.BehaviorTree(

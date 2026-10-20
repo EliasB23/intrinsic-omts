@@ -50,10 +50,25 @@ frames:
   preplace_vise_frame: "vise_pre_place"
   place_vise_frame: "vise_place"
 
+grasp:
+  planner: "cuboid_center"
+  # moveit_* configurations below are only relevant when planner is "moveit"
+  moveit_tool_frame_name: "hande_tcp"
+  moveit_group_name: "ur_manipulator"
+  moveit_end_effector_group: "hand"
+  # raw_stock_2x3x5's long (127 mm) axis is Y, so 0,1,4,5 means "any long face,
+  # never an end cap": an end-cap grasp holds the part cantilevered by its tip.
+  moveit_surfaces: [0, 1, 4, 5]
+  moveit_num_rotations: 4
+  moveit_retract_dist_m: 0.05
+  moveit_timeout_ms: 15000.0
+  moveit_settle_seconds: 0.3
+
 cycle:
   num_cycles: 1
   workpiece_id: "raw_stock_2x3x5"
   approach_offset_z: 0.08
+  standoff_distance_meters: 0.02
   retract_distance_meters: 0.015
   pick_touchdown_force_newtons: 10.0
   load_seat_force_newtons: 10.0

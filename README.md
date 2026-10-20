@@ -98,44 +98,18 @@ flowchart TD
     INFEED --> CNC_LOAD --> MACHINING --> CNC_UNLOAD --> OUTFEED
 ```
 
-### 2. Repository layout
-
-```text
-omts/
-├── .bazelrc                             # Compiler flags, toolchains, and CUDA settings
-├── .bazelversion                        # Pinned Bazel version (8.x)
-├── MODULE.bazel                         # Bzlmod dependencies (@intrinsic-core, @intrinsic_apis)
-├── BUILD                                # Defines intrinsic_solution(:omts_solution)
-├── configs/                             # Cell YAML configs, .pbtxt updates & service manifests
-│   ├── common/                          # Shared service configs & asset manifests
-│   ├── omts/                            # Production cell (UR5e, CNC enclosure, Schunk vise)
-│   ├── lab_bb_01/                       # Lab cell (UR3e, CAW enclosure, no CNC/vise)
-│   └── kr_10/                           # KUKA KR10 placeholder config
-├── models/                              # SDF/GLB 3D scene assets & manifests
-├── src/                                 # Main OMTS Python package (//src:omts_app)
-│   ├── main.py                          # Application CLI entrypoint
-│   ├── core/                            # Domain models, infeed strategies & YAML config
-│   ├── behaviors/                       # Master Behavior Tree & 5 cycle subtrees
-│   ├── hardware/                        # Robot, Gripper, Machine & Vision SBL adapters
-│   ├── utils/                           # Dynamic frame calculator & script/math helpers
-│   └── foundationpose/                  # Triton config & Bazel MLModel packaging for FoundationPose
-├── third_party/                         # C++/CUDA bindings, model.py & deps for FoundationPose
-├── tools/                               # Commissioning, calibration, jogging & world CLI tools
-└── tests/                               # Offline hermetic unit test suite
-```
-
-### 3. Object-oriented design and SBL abstractions
+### 2. Architecture and SBL abstractions
 
 OMTS adheres to clean separation of concerns:
 
 - **Domain Models ([`src/core/`](src/core/))**: Represents manufacturing state (`Workpiece`, `PartState`, `TraySlot`, `WorkcellState`) independently from robot kinematics.
-- **Hardware Adapters ([`src/hardware/`](src/hardware/))**: Unified interfaces (`Robot`, `Gripper`, `Machine`, `VisionSensor`) wrapping low-level SBL gRPC stubs and allowing seamless substitution with mock objects during unit testing.
+- **Hardware Adapters ([`src/hardware/`](src/hardware/))**: Stateless adapters that build SBL skill tasks. `Robot` is a single class for any ICON-controlled arm because the motion and attachment skills it wraps are vendor-neutral; grippers, the CNC machine, and the camera have interfaces with device-specific implementations.
 - **Infeed Strategy Pattern ([`src/core/infeed.py`](src/core/infeed.py))**: Encapsulates part acquisition logic:
   - `PerceptionInfeed`: Uses camera + pose estimation for unstructured / random part placement.
   - `GridInfeed`: Uses mathematical row/column indexing for structured tray pallets.
 - **Composable Behavior Trees ([`src/behaviors/`](src/behaviors/))**: Modular factory functions returning standard `bt.Node` / `bt.SubTree` building blocks.
 
-### 4. Prerequisites and workspace setup
+### 3. Prerequisites and workspace setup
 
 #### Hardware requirements
 
@@ -148,47 +122,6 @@ OMTS adheres to clean separation of concerns:
 - **Storage**: 1 TB NVMe SSD (minimum 100 GB dedicated free space).
 - **Networking**: 2–3 Gigabit Ethernet ports (Port 1: LAN/Internet; Port 2:
   Real-time Robot Controller; Optional Port 3: PoE Camera switch).
-
-#### Workspace and dependencies
-
-Bazel downloads the pre-packaged **Intrinsic Core** release archive
-(`intrinsic-core.tar.gz`, which includes all binary assets) automatically via
-[`MODULE.bazel`](MODULE.bazel), so no manual `intrinsic-core` checkout is
-required:
-
-```python
-bazel_dep(name="intrinsic-core")
-archive_override(
-  module_name="intrinsic-core",
-  patch_strip=1,
-  patches=["//bazel/patches:robotiq_hande_finger_offset.patch"],
-  sha256=INTRINSIC_CORE_SHA256,
-  urls=[INTRINSIC_CORE_URL],
-)
-
-bazel_dep(name="intrinsic_apis", version="0.0.1")
-archive_override(
-  module_name="intrinsic_apis",
-  sha256=INTRINSIC_CORE_SHA256,
-  strip_prefix="./intrinsic_apis",
-  urls=[INTRINSIC_CORE_URL],
-)
-```
-
-**Git LFS** is used by this repository for the 3D scene meshes under `models/`
-(`*.glb`). Install and enable the smudge filter before cloning `intrinsic-omts`:
-
-```bash
-sudo apt-get install git-lfs
-git lfs install
-```
-
-To move to a different Intrinsic Core release, update `INTRINSIC_CORE_RELEASE`
-and `INTRINSIC_CORE_SHA256` in `MODULE.bazel`:
-
-```bash
-curl -fsSL "https://github.com/intrinsic-ai/intrinsic-core/releases/download/<tag>/intrinsic-core.tar.gz" | sha256sum
-```
 
 #### GitHub release artifacts
 
@@ -204,26 +137,51 @@ and model weights from this repository's GitHub Releases (configured in
 - `orbbec_gemini_driver.bundle.tar`: Prebuilt driver service of
   [`flowstate_orbbec`](https://github.com/intrinsic-ai/intrinsic-ros-camera-drivers/tree/main/flowstate_orbbec).
 - `segmentation.tar.gz`: Pretrained RF-DETR segmentation model.
+- `moveit_plan_grasp_skill.bundle.tar`: Prebuilt MoveIt grasp planning skill
+  (`ai.intrinsic.moveit_plan_grasp_skill`). It is installed into every solution
+  so that `--grasp_planner=moveit` works without sideloading, but it only
+  executes once you have stood up the MoveIt planning service — see
+  [§8 Optional integrations](#8-optional-integrations).
 
-### 5. Build and run instructions
+### 4. Build and run instructions
 
-#### 5.1. Deploy the workcell solution
+#### 4.1. Deploy the workcell solution
 
 Build and launch the ICON controller, hardware modules, perception services, and
-simulator:
+simulator. By default, `//:omts_solution` deploys in `real` mode
+(`default_operation_mode = "real"` in [`BUILD`](BUILD)). Pass
+`--operation_mode=sim` after `--` to run in simulation (Gazebo physics and
+simulated 3D camera renders):
 
 ```bash
-# Deploy default OMTS cell (UR5e + CNC enclosure + Schunk vise):
-bazel run //:omts_solution -c opt -- --address=localhost:17080
+# Deploy default OMTS cell (UR5e + CNC enclosure + Schunk vise) in simulation:
+bazel run //:omts_solution -c opt -- \
+  --address=localhost:17080 \
+  --operation_mode=sim
 
-# Deploy Lab BB-01 cell (UR3e + CAW enclosure, no CNC machine):
+# Deploy Lab BB-01 cell (UR3e + CAW enclosure, no CNC machine) in simulation:
+bazel run //:omts_solution -c opt --//:setup=lab_bb_01 -- \
+  --address=localhost:17080 \
+  --operation_mode=sim
+
+# Deploy on physical hardware (defaults to --operation_mode=real):
+bazel run //:omts_solution -c opt -- --address=localhost:17080
 bazel run //:omts_solution -c opt --//:setup=lab_bb_01 -- --address=localhost:17080
 ```
 
-#### 5.2. Apply scene updates (simulation / fresh deployment)
+> [!NOTE]
+> Deploying without `--operation_mode=sim` starts the solution in `real` mode,
+> where ICON requires a real-time kernel and physical robot connection (failing
+> with `no healthy upstream` otherwise) and Gazebo runs as a no-op stub. When
+> switching a running cluster between `real` and `sim`, stop the active solution
+> first (`inctl solution stop --address=localhost:17080`).
+
+#### 4.2. Apply scene updates (simulation / fresh deployment)
 
 Push kinematic attachments, robot base alignment, and scene frames to the live
-`ObjectWorld` (pass `--reset_sim` to synchronize Gazebo's `sim_world`):
+`ObjectWorld`. When the solution is deployed with `--operation_mode=sim`,
+`--reset_sim` (enabled by default) calls `solution.simulator.reset()` to clone
+the updated Belief World (`world`) into Gazebo's `sim_world`:
 
 ```bash
 bazel run //tools/world:apply_scene_updates -- \
@@ -231,7 +189,7 @@ bazel run //tools/world:apply_scene_updates -- \
   --reset_sim
 ```
 
-#### 5.3. Register and verify pose estimator (required before running `omts_app`)
+#### 4.3. Register and verify pose estimator (required before running `omts_app`)
 
 Register the FoundationPose estimator for the raw stock workpiece before
 starting the machine tending application:
@@ -254,7 +212,7 @@ bazel run //tools/pose_estimation:run_pose_estimation -- \
   --pose_estimator_id=ai.intrinsic.raw_stock_2x3x5_estimator
 ```
 
-#### 5.4. Run the OMTS application
+#### 4.4. Run the OMTS application
 
 Connect to the running deployment and execute the machine tending Behavior Tree:
 
@@ -275,9 +233,31 @@ bazel run //src:omts_app -- \
   --config="configs/omts/app_config.yaml" \
   --num_cycles=3 \
   --simulation_mode=fast_preview
+
+# Optionally, plan the infeed grasp with MoveIt instead of the built-in cuboid-center
+# heuristic (requires the MoveIt planning service, see §8):
+bazel run //src:omts_app -- \
+  --address=localhost:17080 \
+  --config="configs/omts/app_config.yaml" \
+  --grasp_planner=moveit
 ```
 
-### 6. Testing and developer tools
+> [!TIP]
+> `--simulation_mode` on `//src:omts_app` controls the SBL Executive preview
+> mode (`reality`, `preview`, `fast_preview`), not the cluster deployment mode.
+> When the solution is deployed with `--operation_mode=sim`, leave
+> `--simulation_mode` at its default (`reality`) so the Behavior Tree executes
+> against Gazebo and the simulated camera; use `preview` or `fast_preview` only
+> for kinematic trajectory previews in the Belief World without stepping Gazebo.
+
+The grasp planner defaults to `cuboid_center`, which derives a top-down grasp
+from the pose estimate and needs no extra services. `--grasp_planner` overrides
+the `grasp.planner` field in `app_config.yaml` for a single run; set that field
+instead to make the choice permanent for a cell. The `grasp.moveit_*` config
+fields (planning group, candidate surfaces, retract distance, timeout) only
+apply to the `moveit` backend.
+
+### 5. Testing and developer tools
 
 #### Unit tests
 
@@ -312,7 +292,7 @@ bazel run //tools/gripper:control_gripper -- --address=localhost:17080 --action=
 bazel run //tools/machine:control_machine -- --address=localhost:17080 --action=open_door
 ```
 
-### 7. Code quality and formatting
+### 6. Code quality and formatting
 
 OMTS enforces formatting and linting checks on all pull requests via GitHub
 Actions CI (`line-length = 80`, `indent-width = 2`):
@@ -325,7 +305,7 @@ Actions CI (`line-length = 80`, `indent-width = 2`):
 ./tools/lint.sh
 ```
 
-### 8. Licensing information for NVIDIA FoundationPose®
+### 7. Licensing information for NVIDIA FoundationPose®
 
 OMTS uses the FoundationPose model by NVIDIA for RGB-D pose estimation.
 FoundationPose is packaged into an `MlModelAsset` in
@@ -353,11 +333,34 @@ distribute these weights.
 
 ---
 
+## 8. Optional integrations
+
+MoveIt grasp planning is an opt-in alternative to the built-in cuboid-center
+heuristic. The integration code is third-party and lives under
+[`third_party/intrinsic_moveit/`](third_party/intrinsic_moveit/README.md); it is
+reachable two ways:
+
+- **From the main application**: `bazel run //src:omts_app -- --grasp_planner=moveit`
+  (or `grasp: {planner: "moveit"}` in `app_config.yaml`). Perception still
+  localizes the workpiece, but MoveIt plans the grasp on it.
+- **Standalone**: the `moveit_plan_grasp_and_move` CLI tool, for bringing the
+  integration up and debugging candidates outside a production cycle.
+
+> [!NOTE]
+> Until you have completed the [intrinsic-moveit](https://github.com/intrinsic-ai/intrinsic-moveit)
+> integration against your solution, `--grasp_planner=moveit` will fail at
+> runtime and the standalone tools will do nothing. The default
+> `--grasp_planner=cuboid_center` path is unaffected. See
+> [`third_party/intrinsic_moveit/README.md`](third_party/intrinsic_moveit/README.md)
+> for the prerequisites and the tool reference.
+
+---
+
 ## Contributing and community
 
 Contributions are welcome! Please review:
 
-* [CONTRIBUTING.md](CONTRIBUTING.md): Details on signing the Google Contributor License Agreement (CLA), community guidelines, C++20 coding standards, and pull request workflows.  
+* [CONTRIBUTING.md](CONTRIBUTING.md): Details on signing the Google Contributor License Agreement (CLA), community guidelines, C++20 coding standards, and pull request workflows.
 * [SECURITY.md](SECURITY.md): Instructions for reporting security vulnerabilities.
 
 ---
@@ -368,7 +371,7 @@ This project is licensed under the [Apache 2.0 License](LICENSE).
 
 ---
 
-> **Disclaimer**: This is not an officially supported Google product.
+**Disclaimer**: This is not an officially supported Google product.
 
 ---
 
